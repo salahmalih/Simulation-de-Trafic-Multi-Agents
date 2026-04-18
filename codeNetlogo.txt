@@ -1,0 +1,788 @@
+breed [ cars car ]
+breed [ lights light ]
+breed [ fires fire ]
+breed [ timerlabels timerlabel ]
+timerlabels-own [ my-light ]
+
+cars-own [
+  speed
+  max-speed
+  safety-distance
+  car-ahead
+  wait-time
+  crashed
+  crash-timer
+  trip-start-tick
+  trip-distance
+  turning
+  stuck-timer
+  committed-to-stop
+  braking
+  near-intersection
+  reaction-delay
+  caution-level
+]
+
+lights-own [
+  state
+  timer-count
+  intersection-x
+  intersection-y
+  axis
+]
+
+fires-own [
+  fire-age
+]
+
+globals [
+  road-color
+  lane-color
+  sidewalk-color
+  green-duration
+  red-duration
+  yellow-duration
+]
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SETUP
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup
+  clear-all
+  set road-color      2.5
+  set lane-color      yellow
+  set sidewalk-color  55
+  set green-duration  60
+  set red-duration    60
+  set yellow-duration 10
+
+  file-open "trafic_stats.csv"
+  file-print "tick,num_cars,max_speed_limit,min_safety_distance,mean_speed,num_stopped,num_crashes"
+  file-close
+
+  setup-roads
+  setup-lights
+  reset-ticks
+  setup-cars
+  initialize-plots
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ROADS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-roads
+  ask patches [ set pcolor sidewalk-color ]
+
+  ; Main road asphalt
+  ask patches with [ pycor >= -3 and pycor <= 3 ] [
+    set pcolor road-color
+  ]
+  ask patches with [ pxcor >= -3 and pxcor <= 3 ] [
+    set pcolor road-color
+  ]
+
+  ; Crosswalks (white dashed lines)
+  ask patches with [ (pxcor = 4 or pxcor = -4) and (pycor >= -3 and pycor <= 3) ] [
+    if pycor mod 2 != 0 [ set pcolor white ]
+  ]
+  ask patches with [ (pycor = 4 or pycor = -4) and (pxcor >= -3 and pxcor <= 3) ] [
+    if pxcor mod 2 != 0 [ set pcolor white ]
+  ]
+
+  ; Center median lines (solid yellow)
+  ask patches with [
+    pycor = 0 and (pxcor < -3 or pxcor > 3)
+  ] [ set pcolor lane-color ]
+  ask patches with [
+    pxcor = 0 and (pycor < -3 or pycor > 3)
+  ] [ set pcolor lane-color ]
+
+  ; Ensure the absolute center intersection is clean asphalt
+  ask patches with [ pxcor >= -3 and pxcor <= 3 and pycor >= -3 and pycor <= 3 ] [
+    set pcolor road-color
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; TRAFFIC LIGHTS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-lights
+  ; H-axis traffic lights (Horizontal flow control)
+  create-lights 1 [
+    setxy -4 4  set shape "circle"  set size 1.5
+    set state "green"  set timer-count green-duration  set color green
+    set axis "H"  set intersection-x 0  set intersection-y 0  set label "H"
+  ]
+  create-lights 1 [
+    setxy 4 -4  set shape "circle"  set size 1.5
+    set state "green"  set timer-count green-duration  set color green
+    set axis "H"  set intersection-x 0  set intersection-y 0  set label "H"
+  ]
+
+  ; V-axis traffic lights (Vertical flow control)
+  create-lights 1 [
+    setxy 4 4  set shape "circle"  set size 1.5
+    set state "red"  set timer-count red-duration  set color red
+    set axis "V"  set intersection-x 0  set intersection-y 0  set label "V"
+  ]
+  create-lights 1 [
+    setxy -4 -4  set shape "circle"  set size 1.5
+    set state "red"  set timer-count red-duration  set color red
+    set axis "V"  set intersection-x 0  set intersection-y 0  set label "V"
+  ]
+
+  let light-data []
+  ask lights [ set light-data lput (list self xcor ycor) light-data ]
+  foreach light-data [ entry ->
+    let the-light item 0 entry
+    let lx item 1 entry
+    let ly item 2 entry
+    create-timerlabels 1 [
+      setxy lx (ly + 1.5)
+      set shape "default"  set size 0.1  set label ""
+      set label-color white  set my-light the-light
+    ]
+  ]
+end
+
+to update-lights
+  let cx 0
+  let cy 0
+  let h-lights lights with [ axis = "H" and intersection-x = cx and intersection-y = cy ]
+  let v-lights lights with [ axis = "V" and intersection-x = cx and intersection-y = cy ]
+  let h-rep one-of h-lights
+
+  if h-rep != nobody [
+    ask h-rep [ set timer-count timer-count - 1 ]
+    if [timer-count] of h-rep <= 0 [
+      ask h-lights [
+        ifelse state = "green" [
+          set state "yellow" set color yellow set timer-count yellow-duration
+        ][
+          ifelse state = "yellow" [
+            set state "red" set color red set timer-count red-duration
+          ][
+            set state "green" set color green set timer-count green-duration
+          ]
+        ]
+      ]
+      if [state] of h-rep = "green" [
+        ask v-lights [ set state "red" set color red set timer-count red-duration ]
+      ]
+      if [state] of h-rep = "red" [
+        ask v-lights [ set state "green" set color green set timer-count green-duration ]
+      ]
+      let ref-state [state] of h-rep
+      let ref-color [color] of h-rep
+      let ref-timer [timer-count] of h-rep
+      ask h-lights [
+        set state ref-state  set color ref-color  set timer-count ref-timer
+      ]
+    ]
+  ]
+
+  ask timerlabels [
+    if my-light != nobody [
+      set label [timer-count] of my-light
+      set label-color [color] of my-light
+    ]
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CARS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-cars
+  create-cars num-cars [
+    let spawn-patch one-of patches with [ lane-patch? self and not any? other cars-here ]
+    if spawn-patch != nobody [
+      move-to spawn-patch
+      set heading lane-heading-of spawn-patch
+    ]
+    set crash-timer 0
+    set trip-start-tick ticks
+    set trip-distance 0
+    set turning false
+    set stuck-timer 0
+    set committed-to-stop false
+    set braking false
+    set near-intersection false
+    set reaction-delay random 3
+    set caution-level 0
+
+    set max-speed max-speed-limit
+    set speed 0.5 + random-float (max-speed - 0.5)
+    set safety-distance min-safety-distance
+    set shape "car top"
+    set color one-of [ blue green orange cyan violet pink magenta ]
+    set size 1.2
+    set wait-time 0
+    set crashed false
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; GO
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to go
+  update-lights
+
+  ask cars with [ crashed ] [
+    set crash-timer crash-timer + 1
+    if crash-timer > 200 [
+      let spawn-patch one-of patches with [ lane-patch? self and not any? cars-here ]
+      if spawn-patch != nobody [
+        move-to spawn-patch
+        set heading lane-heading-of spawn-patch
+        set speed 0.3
+        set crashed false
+        set crash-timer 0
+        set turning false
+        set stuck-timer 0
+        set committed-to-stop false
+        set braking false
+        set caution-level 0
+        set color one-of [ blue green orange cyan violet pink magenta ]
+      ]
+    ]
+  ]
+
+  ask cars with [ not crashed ] [
+    set stuck-timer ifelse-value (speed < 0.05) [ stuck-timer + 1 ] [ 0 ]
+    detect-car-ahead
+    update-near-intersection-flag
+    make-intelligent-decision
+    move-forward
+    set trip-distance trip-distance + speed
+    align-with-lane
+    stay-on-road
+    update-wait-time
+    check-near-miss
+    check-collision-safe
+  ]
+
+  ask cars with [ not crashed and stuck-timer > 40 ] [
+    anti-deadlock-resolve
+  ]
+
+  if ticks mod 30 = 0 [
+    ask cars with [ not crashed and caution-level > 0 ] [
+      set caution-level caution-level - 1
+    ]
+  ]
+
+  update-fires
+  handle-emergency-vehicles
+  export-stats-to-csv
+  update-all-plots
+  tick
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; PLOTS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to initialize-plots
+  carefully [ clear-all-plots ] [ ]
+  update-all-plots
+end
+
+to update-all-plots
+  carefully [
+    set-current-plot "Traffic Flow"
+    set-current-plot-pen "Mean Speed"
+    plot mean-speed
+    set-current-plot-pen "Stopped Cars"
+    plot num-stopped-cars
+  ] [ ]
+
+  carefully [
+    set-current-plot "Safety"
+    set-current-plot-pen "Crashes"
+    plot num-crashes
+    set-current-plot-pen "Collision Rate (%)"
+    plot collision-rate
+  ] [ ]
+
+  carefully [
+    set-current-plot "Travel Quality"
+    set-current-plot-pen "Mean Wait"
+    plot mean-wait-time
+    set-current-plot-pen "Mean Trip Time"
+    plot mean-trip-time
+    set-current-plot-pen "Stuck In Intersection"
+    plot cars-stuck-in-intersection
+  ] [ ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; NEAR-INTERSECTION FLAG
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-near-intersection-flag
+  set near-intersection false
+  if (abs xcor <= 6) and (abs ycor <= 6) [
+    set near-intersection true
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; INTELLIGENT DECISION ENGINE
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to make-intelligent-decision
+  if reaction-delay > 0 and speed < 0.3 [
+    set reaction-delay reaction-delay - 1
+    stop
+  ]
+
+  apply-defensive-braking
+
+  if should-stop-for-light? [
+    set speed 0
+    set committed-to-stop true
+    stop
+  ]
+
+  if committed-to-stop and can-go-on-green? [
+    set committed-to-stop false
+  ]
+
+  ;; Kick-start cars that are clear to move but got stuck at very low speed.
+  if (not committed-to-stop) and car-ahead = nobody and speed < 0.08 [
+    set speed min list max-speed 0.12
+  ]
+
+  if car-ahead != nobody [
+    if [committed-to-stop] of car-ahead [
+      let dist distance car-ahead
+      let queue-gap min list (safety-distance + 1.2) 3.0
+      if dist < queue-gap [
+        set speed 0
+        stop
+      ]
+    ]
+  ]
+
+  if cross-traffic-danger? [
+    set speed max list 0 (speed - 0.6)
+    if speed < 0.1 [ stop ]
+  ]
+
+  check-intersection-zone
+
+  adjust-speed-smart
+
+  if near-intersection [
+    proactive-intersection-slowdown
+  ]
+end
+
+to apply-defensive-braking
+  ifelse car-ahead = nobody [
+    set braking false
+  ][
+    let dist distance car-ahead
+    let relative-speed speed - [speed] of car-ahead
+    let required-gap min list (safety-distance + max list 0 (relative-speed * 2.5)) 3.8
+
+    if relative-speed > 0 and dist < required-gap [
+      set speed max list 0 (speed - 0.8)
+      set braking true
+    ]
+  ]
+end
+
+to-report cross-traffic-danger?
+  if not near-intersection [ report false ]
+
+  let crossing-cars other cars in-radius 2.5 with [
+    not crashed and
+    speed > 0.15 and
+    (abs (heading - [heading] of myself)) > 60 and
+    (abs (heading - [heading] of myself)) < 300
+  ]
+  report any? crossing-cars
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; PROACTIVE INTERSECTION SLOWDOWN
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to proactive-intersection-slowdown
+  let nearest-dist sqrt (xcor ^ 2 + ycor ^ 2)
+
+  let approach-cap max-speed * (0.35 + (nearest-dist / 6) * 0.45)
+  let caution-factor 1 - (caution-level * 0.08)
+  set approach-cap approach-cap * caution-factor
+
+  if speed > approach-cap [
+    set speed max list approach-cap (speed - 0.06)
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; NEAR-MISS DETECTOR
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to check-near-miss
+  let very-close other cars in-radius 1.0 with [ not crashed ]
+  if any? very-close [
+    set speed max list 0 (speed - 0.5)
+    set braking true
+    if caution-level < 3 [
+      set caution-level caution-level + 1
+    ]
+  ]
+  if not any? very-close [
+    set braking false
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; TRAFFIC LIGHT LOGIC
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report should-stop-for-light?
+  let light-axis ""
+
+  if heading = 90 or heading = 270 [
+    set light-axis "H"
+  ]
+  if heading = 0 or heading = 180 [
+    set light-axis "V"
+  ]
+
+  if light-axis = "" [ report false ]
+
+  let relevant-light one-of lights with [ axis = light-axis ]
+  if relevant-light = nobody [ report false ]
+
+  let light-state [state] of relevant-light
+
+  if light-axis = "H" [
+    if light-state = "red" [
+      if abs ycor <= 3 and abs xcor <= 5 [ report true ]
+    ]
+    if light-state = "yellow" [
+      if abs ycor <= 3 and abs xcor <= 2 [ report true ]
+      if abs ycor <= 3 and abs xcor <= 5 [
+        set speed max list 0 (speed - 0.35)
+      ]
+    ]
+  ]
+
+  if light-axis = "V" [
+    if light-state = "red" [
+      if abs xcor <= 3 and abs ycor <= 5 [ report true ]
+    ]
+    if light-state = "yellow" [
+      if abs xcor <= 3 and abs ycor <= 2 [ report true ]
+      if abs xcor <= 3 and abs ycor <= 5 [
+        set speed max list 0 (speed - 0.35)
+      ]
+    ]
+  ]
+
+  report false
+end
+
+to-report can-go-on-green?
+  let candidates lights in-cone 3 90
+  if not any? candidates [ report true ]
+  report [state] of min-one-of candidates [distance myself] = "green"
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ANTI-DEADLOCK
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to anti-deadlock-resolve
+  let candidates lights in-cone 3 90 with [ state = "red" ]
+  if not any? candidates [
+    let escape-patch one-of patches with [
+      lane-patch? self and not any? cars-here and distance myself < 5 and distance myself > 1
+    ]
+    if escape-patch != nobody [
+      face escape-patch
+      set heading lane-heading-of patch-here
+      set speed 0.2
+      set stuck-timer 0
+      set committed-to-stop false
+    ]
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; INTERSECTION BEHAVIOR
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to check-intersection-zone
+  if (abs xcor <= 4) and (abs ycor <= 4) [
+    set speed min list speed (max-speed * 0.55)
+
+    let passed-center? ((heading = 90 and xcor > 2) or (heading = 270 and xcor < -2) or (heading = 0 and ycor > 2) or (heading = 180 and ycor < -2))
+
+    if passed-center? and not turning [
+      let choice random 3
+      let left-h (heading - 90) mod 360
+      let right-h (heading + 90) mod 360
+      
+      if choice = 0 [
+        if turn-lane-clear? left-h [ set heading left-h  set turning true ]
+      ]
+      if choice = 1 [
+        if turn-lane-clear? right-h [ set heading right-h  set turning true ]
+      ]
+      if choice = 2 [ set turning true ]
+    ]
+
+    let crossing-cars other cars in-radius 2 with [
+      not crashed and
+      (abs (heading - [heading] of myself)) > 45 and
+      (abs (heading - [heading] of myself)) < 315
+    ]
+    if any? crossing-cars [
+      if [speed] of min-one-of crossing-cars [distance myself] > speed [
+        set speed max list 0 (speed - 0.3)
+      ]
+    ]
+
+    let center-blocked any? other cars in-radius 1.5 with [ not crashed and speed < 0.05 ]
+    if center-blocked [
+      set speed 0
+    ]
+  ]
+end
+
+to-report turn-lane-clear? [ target-h ]
+  let clearance 3.5
+  let blocking-cars other cars in-radius clearance with [
+    not crashed and abs (heading - target-h) < 30
+  ]
+  report not any? blocking-cars
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SPEED CONTROL
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to adjust-speed-smart
+  let caution-bonus caution-level * 0.5
+  let dynamic-safety min list (safety-distance + speed * 2.2 + caution-bonus) 4.0
+
+  ifelse car-ahead != nobody [
+    let dist distance car-ahead
+    let ahead-speed [speed] of car-ahead
+
+    ifelse [committed-to-stop] of car-ahead [
+      if dist < (min list (safety-distance + 1.5) 3.2) [ set speed 0 ]
+    ][
+      let ahead-braking [braking] of car-ahead
+      let brake-multiplier ifelse-value ahead-braking [ 1.5 ] [ 1.0 ]
+
+      ifelse dist < (dynamic-safety * 0.4) [
+        set speed max list 0 (speed - 0.6 * brake-multiplier)
+      ][
+        ifelse dist < (dynamic-safety * 0.7) [
+          set speed max list 0 (speed - 0.35 * brake-multiplier)
+        ][
+          ifelse dist < dynamic-safety [
+            set speed max list 0 (min list speed (ahead-speed + 0.02))
+          ][
+            accelerate-if-safe
+          ]
+        ]
+      ]
+    ]
+  ][
+    accelerate-if-safe
+  ]
+end
+
+to accelerate-if-safe
+  let accel-rate 0.05 - (caution-level * 0.01)
+  let near-red any? lights in-cone (3 + speed * 2) 20 with [ state = "red" or state = "yellow" ]
+  if not near-red [
+    set speed min list max-speed (speed + max list 0.01 accel-rate)
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; MOVEMENT & ROAD
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to detect-car-ahead
+  set car-ahead nobody
+  let look-distance min list (safety-distance + 2.0) 4.8
+  let candidates other cars in-cone look-distance 24 with [ not crashed ]
+  if any? candidates [
+    set car-ahead min-one-of candidates [ distance myself ]
+  ]
+end
+
+to move-forward
+  if speed > 0 [ fd speed ]
+end
+
+to stay-on-road
+  if not lane-patch? patch-here [
+    move-to min-one-of patches with [ lane-patch? self ] [ distance myself ]
+    set heading lane-heading-of patch-here
+    set speed 0
+  ]
+end
+
+to align-with-lane
+  ifelse turning [
+    let still-in-intersection false
+    let cx 0
+    let cy 0
+    if (abs (xcor - cx) <= 4) and (abs (ycor - cy) <= 4) [
+      set still-in-intersection true
+    ]
+    if not still-in-intersection [
+      set turning false
+      set heading lane-heading-of patch-here
+    ]
+  ][
+    set heading lane-heading-of patch-here
+  ]
+end
+
+to update-wait-time
+  ifelse speed < 0.1
+  [ set wait-time wait-time + 1 ]
+  [ set wait-time 0 ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; COLLISION
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to check-collision-safe
+  let too-close other cars in-radius 1.2 with [ not crashed and speed > 0.05 ]
+  if any? too-close [ set speed 0 ]
+
+  let colliding other cars in-radius 0.7 with [ not crashed ]
+  if any? colliding [
+    set crashed true  set color black  set speed 0  set committed-to-stop false
+    ask colliding [
+      set crashed true  set color black  set speed 0  set committed-to-stop false
+    ]
+    ask patch-here [
+      sprout-fires 3 [
+        setxy pxcor + (random-float 1 - 0.5) pycor + (random-float 1 - 0.5)
+        set shape "circle"  set size 0.6 + random-float 0.8
+        set color orange  set fire-age 0
+      ]
+    ]
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; FIRE
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-fires
+  ask fires [
+    set fire-age fire-age + 1
+    set color one-of [ orange red yellow ]
+    set size size + random-float 0.05 - 0.025
+    if fire-age > 30 [ set size size - 0.03  set color one-of [ red orange 15 ] ]
+    if fire-age > 150 [ die ]
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; EMERGENCY VEHICLES
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to handle-emergency-vehicles
+  ask cars with [ color = red and not crashed ] [
+    let zone cars in-radius 6 with [ color != red and not crashed ]
+    ask zone [ set speed max list 0 (speed - 0.3) ]
+    set speed max-speed
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; REPORTERS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report lane-patch? [ p ]
+  let px [pxcor] of p
+  let py [pycor] of p
+  report (
+    (py = 2 or py = -2) or
+    (px = 2 or px = -2)
+  )
+end
+
+to-report lane-heading-of [ p ]
+  let px [pxcor] of p
+  let py [pycor] of p
+  if py =  2 [ report 90  ]
+  if py = -2 [ report 270 ]
+  if px = -2 [ report 0   ]
+  if px =  2 [ report 180 ]
+  report heading
+end
+
+to-report mean-speed
+  ifelse any? cars with [ not crashed ]
+  [ report mean [speed] of cars with [ not crashed ] ]
+  [ report 0 ]
+end
+
+to-report num-stopped-cars
+  report count cars with [ speed < 0.1 and not crashed ]
+end
+
+to-report num-crashes
+  report count cars with [ crashed ]
+end
+
+to-report collision-rate
+  ifelse count cars > 0
+  [ report (count cars with [ crashed ] / count cars) * 100 ]
+  [ report 0 ]
+end
+
+to-report mean-wait-time
+  ifelse any? cars with [ not crashed ]
+  [ report mean [wait-time] of cars with [ not crashed ] ]
+  [ report 0 ]
+end
+
+to-report mean-trip-time
+  ifelse any? cars with [ not crashed and trip-distance > 5 ]
+  [ report mean [ticks - trip-start-tick] of cars with [ not crashed and trip-distance > 5 ] ]
+  [ report 0 ]
+end
+
+to-report cars-stuck-in-intersection
+  let stuck count cars with [
+    abs xcor <= 4 and abs ycor <= 4 and speed < 0.1 and not crashed
+  ]
+  report stuck
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CSV EXPORT
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to export-stats-to-csv
+  file-open "trafic_stats.csv"
+  file-print (word
+    ticks ","  num-cars ","  max-speed-limit ","
+    min-safety-distance ","  precision mean-speed 3 ","
+    num-stopped-cars ","  num-crashes
+  )
+  file-close
+end
